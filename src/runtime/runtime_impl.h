@@ -205,8 +205,9 @@ typedef struct {
     gs_stack *stack;       /* Stable descriptor of the owning data stack. */
     /* Windows: one past the highest page the fault handler has
        committed, so gs_trim_memory releases only what was ever committed
-       rather than walking the whole reservation. Unused on POSIX, where
-       the kernel supplies pages on touch. */
+       rather than walking the whole reservation. Pages below it can still
+       be uncommitted: skipped by growth or decommitted by slice_pool's
+       trim. Unused on POSIX, where the kernel supplies pages on touch. */
     uint8_t *committed;
 } gs_region;
 static GS_TLS gs_region *gs_regions;
@@ -341,10 +342,15 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
             /* Within the usable part: commit another chunk (clamped to the
                region) and resume, or where the system has no more memory to
-               commit, say so. Within the gap: a data stack overran. */
+               commit, say so. A read below the commit mark (a page that was
+               skipped or decommitted by slice_pool's trim) commits only its
+               page, so a stale view does not take back the pages around it;
+               a write there still takes a chunk, as reuse writes on. Within
+               the gap: a data stack overran. */
             if (hit < r->base + r->usable) {
                 uint8_t *page = (uint8_t *)((size_t)hit & ~(gs_page_size - 1));
-                size_t n = GS_COMMIT_CHUNK;
+                size_t n = page < r->committed && ep->ExceptionRecord->ExceptionInformation[0] == 0
+                               ? gs_page_size : GS_COMMIT_CHUNK;
                 if (page + n > r->base + r->usable)
                     n = (size_t)(r->base + r->usable - page);
                 if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE)) {
@@ -441,6 +447,9 @@ static GS_NORETURN void gs_park(void) {
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 /* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
    usable address up to its top: a fault in there is that stack overflowing,
@@ -1489,6 +1498,28 @@ GS_API int64_t gs_scan_pair(const uint8_t *p, int64_t n, const void *a, int64_t 
     return gs_scan_pair_bytes(p, np, sa, d, sb);
 }
 
+/* The 64 MB of CMakeLists.txt's goose_main_stack. Linux does not reserve the
+   main thread's stack at link time: it grows until the soft RLIMIT_STACK,
+   often 8 MB where the process was started. Raised here, and not lowered
+   when it is already higher, and not past the hard limit. goose's main does
+   the same for the compiler process (main.cpp). */
+GS_API void gs_raise_main_stack(void) {
+#ifdef __linux__
+    struct rlimit rl;
+    const rlim_t want = (rlim_t)64 << 20;
+    if (getrlimit(RLIMIT_STACK, &rl)) return;
+    if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < want) {
+        if (rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            (void)setrlimit(RLIMIT_STACK, &rl);
+        }
+    } else if (rl.rlim_cur < want) {
+        rl.rlim_cur = want;
+        (void)setrlimit(RLIMIT_STACK, &rl);
+    }
+#endif
+}
+
 GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
                         uint64_t budget, int64_t mainregions, int64_t workerregions) {
     /* A host's goose_init of a second program (an image it reloaded, say)
@@ -1537,6 +1568,9 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
     #endif
     gs_regions_init();
     gs_regions_begin(mainregions);
+    /* Before the bounds gs_native_stack_init reads. On Linux those bounds are
+       the soft RLIMIT_STACK, which the kernel consults as the main stack grows. */
+    gs_raise_main_stack();
     gs_native_stack_init();
     gs_scan_init();
 }

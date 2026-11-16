@@ -104,9 +104,11 @@ run has TinyCC compile the C on such a thread as well (`CompileJit` in
 `jit.h`), since TinyCC's parser recurses as deep as the C nests, and starts
 the program back on the main thread (`RunJit`), because macOS only lets a
 window be created on the main thread. On Windows and macOS the link also
-reserves 64 MB for the main thread's stack (`CMakeLists.txt`). On Linux the
-main thread has the stack limit the process started with (`ulimit -s`),
-which nothing in the executable sets.
+reserves 64 MB for the main thread's stack (`CMakeLists.txt`). On Linux
+nothing in the link sets it. goose and a built program each raise the soft
+RLIMIT_STACK to that same 64 MB at process start (`gs_raise_main_stack`),
+when the hard limit allows it and the limit is not already higher, and the
+runtime reads the overflow guard's stack bounds after that.
 
 **Verbs** (`Main` in `main.cpp`):
 
@@ -6555,7 +6557,10 @@ object, `gs_rt_start` refuses to start one while another's regions are
 live, rather than forget them.
 
 **Native stacks.** Recursion consumes only the native call stack (spec
-§7.8), whose size is set when its thread starts. Running out of it ends the
+§7.8), whose size is set when its thread starts. A worker reserves
+`GS_THREAD_STACK` (8 MB) where the system's default is less, as on macOS
+(512 KB) and Windows (1 MB), so that a worker has the stack a main thread
+has; it is address space, committed as the stack grows. Running out of it ends the
 program with `goose runtime error: native call stack overflow` and exit
 status 1, as a data stack overrun does. The thread of every thread program
 prepares for this as it starts (`gs_native_stack_init`, called from
@@ -6570,7 +6575,10 @@ already has one (ASan gives every thread its own), and releases it together
 with a worker's data stacks. A fault from 64 KB below the thread's stack up
 to its top counts as that stack overflowing. The bounds of the stack are
 read as the thread starts (`pthread_getattr_np` on Linux,
-`pthread_get_stackaddr_np` and `pthread_get_stacksize_np` on macOS).
+`pthread_get_stackaddr_np` and `pthread_get_stacksize_np` on macOS). On
+Linux the main thread's soft limit has already been raised to 64 MB, so
+those bounds are that limit rather than the 8 MB a process often starts
+with.
 Elsewhere there is no way to read them, and the overflow is not reported.
 For a fault of neither kind, the runtime reinstates the handler it replaced
 and lets the fault recur under that handler, which gives the default action

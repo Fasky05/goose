@@ -997,7 +997,13 @@ R"GSRT(/* The program defines what goose.h gives C compiled on its own (gs_stack
 #define GOOSE_H 1
 
 )GSRT"
-R"GSRT(/* Starts the runtime on main's thread: the program's arguments, each
+R"GSRT(/* Linux: raise the soft RLIMIT_STACK to the 64 MB a Windows or macOS link
+   reserves for the main thread, when the hard limit allows and the soft
+   limit is not already higher. Nothing elsewhere. Called from a program's
+   main and again from gs_rt_start, before the overflow guard's stack bounds
+   are recorded. */
+GS_API void gs_raise_main_stack(void);
+/* Starts the runtime on main's thread: the program's arguments, each
    region's usable reservation and trailing guard gap, the address space
    budgeted for regions over the whole program, and the most regions the
    main program and any one worker hold (the compiler's static counts),
@@ -1596,8 +1602,9 @@ typedef struct {
     gs_stack *stack;       /* Stable descriptor of the owning data stack. */
     /* Windows: one past the highest page the fault handler has
        committed, so gs_trim_memory releases only what was ever committed
-       rather than walking the whole reservation. Unused on POSIX, where
-       the kernel supplies pages on touch. */
+       rather than walking the whole reservation. Pages below it can still
+       be uncommitted: skipped by growth or decommitted by slice_pool's
+       trim. Unused on POSIX, where the kernel supplies pages on touch. */
     uint8_t *committed;
 } gs_region;
 static GS_TLS gs_region *gs_regions;
@@ -1742,10 +1749,15 @@ R"GSRT(static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
             /* Within the usable part: commit another chunk (clamped to the
                region) and resume, or where the system has no more memory to
-               commit, say so. Within the gap: a data stack overran. */
+               commit, say so. A read below the commit mark (a page that was
+               skipped or decommitted by slice_pool's trim) commits only its
+               page, so a stale view does not take back the pages around it;
+               a write there still takes a chunk, as reuse writes on. Within
+               the gap: a data stack overran. */
             if (hit < r->base + r->usable) {
                 uint8_t *page = (uint8_t *)((size_t)hit & ~(gs_page_size - 1));
-                size_t n = GS_COMMIT_CHUNK;
+                size_t n = page < r->committed && ep->ExceptionRecord->ExceptionInformation[0] == 0
+                               ? gs_page_size : GS_COMMIT_CHUNK;
                 if (page + n > r->base + r->usable)
                     n = (size_t)(r->base + r->usable - page);
                 if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE)) {
@@ -1852,6 +1864,9 @@ R"GSRT(#include <sys/mman.h>
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 )GSRT"
 R"GSRT(/* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
@@ -2976,6 +2991,29 @@ R"GSRT(GS_API int64_t gs_scan_pair(const uint8_t *p, int64_t n, const void *a, i
 }
 
 )GSRT"
+R"GSRT(/* The 64 MB of CMakeLists.txt's goose_main_stack. Linux does not reserve the
+   main thread's stack at link time: it grows until the soft RLIMIT_STACK,
+   often 8 MB where the process was started. Raised here, and not lowered
+   when it is already higher, and not past the hard limit. goose's main does
+   the same for the compiler process (main.cpp). */
+GS_API void gs_raise_main_stack(void) {
+#ifdef __linux__
+    struct rlimit rl;
+    const rlim_t want = (rlim_t)64 << 20;
+    if (getrlimit(RLIMIT_STACK, &rl)) return;
+    if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < want) {
+        if (rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            (void)setrlimit(RLIMIT_STACK, &rl);
+        }
+    } else if (rl.rlim_cur < want) {
+        rl.rlim_cur = want;
+        (void)setrlimit(RLIMIT_STACK, &rl);
+    }
+#endif
+}
+
+)GSRT"
 R"GSRT(GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
                         uint64_t budget, int64_t mainregions, int64_t workerregions) {
     /* A host's goose_init of a second program (an image it reloaded, say)
@@ -3024,6 +3062,9 @@ R"GSRT(GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t
     #endif
     gs_regions_init();
     gs_regions_begin(mainregions);
+    /* Before the bounds gs_native_stack_init reads. On Linux those bounds are
+       the soft RLIMIT_STACK, which the kernel consults as the main stack grows. */
+    gs_raise_main_stack();
     gs_native_stack_init();
     gs_scan_init();
 }
@@ -3590,6 +3631,17 @@ R"GSRT(    /* Publish completion only after all Goose storage has been released.
 }
 
 )GSRT"
+R"GSRT(/* The native stack a worker thread reserves: as much as the main thread
+   gets by default on macOS and Linux. The system's default for a thread
+   is far less on some (512 KB on macOS, 1 MB on Windows), which a few
+   native frames holding large fixed values can exhaust: a TLS handshake
+   on a worker thread does. Reserved, not committed: pages are touched as
+   the stack grows. A system default above this is kept. */
+#ifndef GS_THREAD_STACK
+#define GS_THREAD_STACK ((size_t)8 << 20)
+#endif
+
+)GSRT"
 R"GSRT(GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
                                void (*release)(void), void (*entry)(uint8_t *),
                                const void *args, int64_t argsize, int contained) {
@@ -3615,7 +3667,8 @@ R"GSRT(GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *
     gs_threads = t;
     int failed;
     #ifdef _WIN32
-        HANDLE handle = CreateThread(NULL, 0, gs_thread_main, t, 0, NULL);
+        HANDLE handle = CreateThread(NULL, GS_THREAD_STACK, gs_thread_main, t,
+                                      STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         failed = handle == NULL;
         /* Closing the handle does not stop the worker. Completion is tracked
            above, so callers never need to retain or join a native handle. */
@@ -3625,7 +3678,10 @@ R"GSRT(GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *
         pthread_attr_t attr;
         failed = pthread_attr_init(&attr);
         if (!failed) {
+            size_t size = 0;
             failed = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (!failed && !pthread_attr_getstacksize(&attr, &size) && size < GS_THREAD_STACK)
+                failed = pthread_attr_setstacksize(&attr, GS_THREAD_STACK);
             if (!failed) failed = pthread_create(&handle, &attr, gs_thread_main, t);
             pthread_attr_destroy(&attr);
         }
