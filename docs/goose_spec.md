@@ -3678,6 +3678,30 @@ block written inside a `checkfree` function is checked as part of it.
   error with `extern`. A nested function inherits it. Under `--no-bce`
   nothing is verified, and the compiler warns about this.
 
+### 7.15 `deprecated fn`: a call warns
+
+```goose
+deprecated "use copy_from" fn copy_into<T>(dst: T[:], src: T[:]) {
+    copy_from(dst, src);
+}
+```
+
+`deprecated` marks a function that still works and that a program should
+stop calling. It changes nothing about what the program computes.
+
+* A direct call warns, whether it is written `copy_into(dst, src)` or
+  `dst.copy_into(src)`. Naming the function as a value warns there. A later
+  call through that value does not warn again. The warning names the
+  function and, where the declaration gives a string, repeats it:
+  `copy_into is deprecated: use copy_from`. With no string the warning is
+  `copy_into is deprecated`.
+* The string is an ordinary string literal. `deprecated` comes before the
+  other qualifiers (`checkfree`, `export`, `extern`, `simd`, `inline`,
+  `recursive`), and the string, when there is one, follows `deprecated`
+  immediately.
+* `deprecated` is a keyword only in that position, so it stays usable as a
+  name. It applies to nested functions and to `extern fn` the same way.
+
 ## 8. ADTs in use
 
 ### 8.1 `match`
@@ -5112,7 +5136,9 @@ Construction rules (§4.2) write stacks front-to-back. Windows commits on
 fault: the runtime's handler commits a chunk from whichever page
 was touched, so an allocation that skips ahead without writing (a large
 limited-array capacity) needs no explicit commit, and nothing depends on
-touch order. macOS and Linux map the usable region read/write and let the
+touch order. A read below the highest committed page commits only its own
+page, so a stale view of a run that `slice_pool`'s `trim` discarded does
+not take back its neighbors. macOS and Linux map the usable region read/write and let the
 kernel supply physical pages on touch. Fresh pages, including pages
 discarded by `trim_memory`, arrive zeroed from the OS. Reused stack memory
 is not zeroed. This is harmless, since uninitialized slots are unreachable
@@ -5139,12 +5165,13 @@ field       := ("let" | "const")? ident ":" type ("=" expr)? | "pad" intlit?
 typealias   := "type" declname "=" type ";"
 generics    := "<" ident (":" type)? ("," ident (":" type)?)* ">"
 
-fndecl      := "checkfree"? ("export" strlit? | "extern" strlit?)? "checkfree"? "simd"?
-               "inline"? "recursive"? ("fn" | "thread_fn")
+fndecl      := "deprecated" strlit? "checkfree"? ("export" strlit? | "extern" strlit?)?
+               "checkfree"? "simd"? "inline"? "recursive"? ("fn" | "thread_fn")
                declname generics? "(" params? ")" ("->" rettypes)?
                (blockexpr | ("=" strlit)? ";")
                                                  // "=" strlit: extern only, its C symbol
                                                  // "extern" strlit: deprecated, the same
+                                                 // "deprecated" strlit: a call or value warns (§7.15)
                                                  // checkfree at most once (§7.14)
                                                  // nested: ident only
 externblock := "extern" strlit "{" externmember* "}"   // §7.10: the library, then its functions
