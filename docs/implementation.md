@@ -6555,7 +6555,10 @@ object, `gs_rt_start` refuses to start one while another's regions are
 live, rather than forget them.
 
 **Native stacks.** Recursion consumes only the native call stack (spec
-§7.8), whose size is set when its thread starts. Running out of it ends the
+§7.8), whose size is set when its thread starts. A worker reserves
+`GS_THREAD_STACK` (8 MB) where the system's default is less, as on macOS
+(512 KB) and Windows (1 MB), so that a worker has the stack a main thread
+has; it is address space, committed as the stack grows. Running out of it ends the
 program with `goose runtime error: native call stack overflow` and exit
 status 1, as a data stack overrun does. The thread of every thread program
 prepares for this as it starts (`gs_native_stack_init`, called from
@@ -7342,7 +7345,7 @@ refuses outright:
   reason). A callee that stores a view read out of one parameter's storage
   into another parameter's storage is checked in its body by the depths of
   their classes, which bound the storage and not the views it holds. So
-  `copy_into(xs, tmp)` for a local `tmp` of views copied out of the
+  `copy_from(xs, tmp)` for a local `tmp` of views copied out of the
   parameter `xs` is an error, while the same call with slices that may each
   be `xs` or `tmp` is judged at the call by what each holds (std's
   `stable_sort` merges its last pass into `xs` instead of copying back for
