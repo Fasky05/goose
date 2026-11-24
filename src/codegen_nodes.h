@@ -259,6 +259,13 @@ inline string Binary::CgX(CodeGen &cg) {
             l = p;
         }
         r = value(right);
+    } else if ((op == T_EQ || op == T_NEQ) && cg.IsBytesT(lt) && cg.HasStmts(right)) {
+        // Copyable variable-size operands are values too. Keeping just the
+        // left operand's address would read its contents after the RHS ran.
+        string stk;
+        l = cg.BytesTemp(stk);
+        cg.GenAny(left, Dst { DK_STACK, stk, lt });
+        r = cg.GenVal(right);
     } else {
         // Copyable fixed operands are read before later statements (§2).
         l = cg.GenOperandVal(left, cg.HasStmts(right));

@@ -1506,9 +1506,12 @@ type. They compare:
 
 References and slices follow a *top-level rule*. As the direct operands of
 `==` they have value-like semantics: a reference compares its pointee
-(transparency, §3.8), and a slice compares length, then elements. As
-*members* of a compared composite they compare by identity (the reference
-address, the slice's address+length): recursing through them would turn
+(transparency, §3.8), and a slice compares length, then elements. The
+left operand's copyable value is read before the right operand runs (§2),
+including when it is a variable-size pointee. Slices still retain a view
+of their elements. As *members* of a compared composite, references and
+slices compare by identity (the reference address, the slice's
+address+length): recursing through them would turn
 `==` into an unbounded pointer traversal. Optionals compare as nullable
 references (`o == null` is the null test); `.==`/`.!=` compare two references by
 address rather than by pointee (§3.8). Ordering `< <= > >=` exists on the numeric
