@@ -272,7 +272,7 @@ fn inplace() {
     fill(xs, 7);
     print(xs[0], xs[1], xs[2]);                                                // 777
     var d = [0, 0, 0];
-    copy_into(d, [4, 5, 6]);
+    copy_from(d, [4, 5, 6]);
     print(d[2]);                                                               // 6
     var r = [1, 2, 3, 4];
     reverse(r);
@@ -447,6 +447,7 @@ fn strings() {
     print(compare("abc", "abd"), " ", compare("b", "a"), " ", compare("a", "a"), " ",
           compare("ab", "abc"));                                               // -1 1 0 -1
     print(trim("  hi \n"), "|", trim_start("  x"), "|", trim_end("y  "), "|");   // hi|x|y|
+    print(trim("\x0bX\x0c").len, " ", words("a\x0bb\x0cc").len);               // 1 3
     let parts = split("a,b,,c", ',');
     print(parts.len, " ", parts[0], parts[3], " ", parts[2].len);              // 4 ac 0
     var n = 0;

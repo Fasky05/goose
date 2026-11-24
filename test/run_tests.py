@@ -1834,6 +1834,56 @@ def main():
         else:
             r.ok(f"last-use moves {f.name}")
     r.show_task(last_use_moves)
+    # Specializations whose C is the same but for the names of the functions
+    # they call and the numbers of their long-distance returns are written
+    # once (CodeGen::MergeSpecs): every function of the fixture but main and
+    # triple is specialized twice (--specs), and has one C function, at -O0,
+    # which inlines nothing, but for mapped, whose copies differ in a
+    # constant and keep two. total's copies call triple, specialized once,
+    # whose name stays in their text. ignore and discard, two functions
+    # whose C is the same (checked, so that this is not vacuous), keep one
+    # each, as only copies of one function merge. Each target number thrown
+    # is one that a kept target catches, and only the kept targets' channels
+    # are declared.
+    def merged_specs():
+        f = HERE / "codegen" / "merged_specs.goose"
+        cfile = gendir / "merged_specs-merged.c"
+        code, out, err = r.goose("-O0", "--specs", "-o", cfile, f)
+        if code != 0:
+            r.fail(f"merged specs {f.name}", out + err)
+            return
+        text = cfile.read_text()
+        names = ["total", "ping", "pong", "reject", "check", "scan", "outer", "inner", "leaf",
+                 "wide_sum", "doubled", "ignore", "discard"]
+        specs = re.findall(r"^// spec \d+:[^\n]*\nfn (\w+)\(", out, re.MULTILINE)
+        wrong = [f"{n}: {specs.count(n)} specializations, want {want}"
+                 for n, want in [(n, 2) for n in names + ["mapped"]] + [("triple", 1)]
+                 if specs.count(n) != want]
+        for n, er, want in ([(n, "", 1) for n in names + ["triple"]] +
+                            [("doubled", "_er", 1), ("mapped", "", 2)]):
+            defs = re.findall(rf"^static [^\n;]*\b{n}_g(?:_\d+)?{er}\([^\n]*\) \{{$",
+                              text, re.MULTILINE)
+            if len(defs) != want:
+                wrong.append(f"{n}{er}: {len(defs)} C functions, want {want}")
+        # A function's parameters and body, without its name.
+        def body(n):
+            m = re.search(rf"^static [^\n;]*\b{n}_g(?:_\d+)?(\([^\n]*\) \{{\n.*?^\}})$",
+                          text, re.MULTILINE | re.DOTALL)
+            return m.group(1) if m else None
+        if body("ignore") is None or body("ignore") != body("discard"):
+            wrong.append("ignore and discard: not the same C, so keeping them apart tests nothing")
+        caught = re.findall(r"\bgs_rf == (\d+)\)", text)
+        thrown = set(re.findall(r"\bgs_rf = ([1-9]\d*);", text))
+        declared = set(re.findall(r"^static GS_TLS [^\n]*\bgs_lret_(\d+)_0;$", text, re.MULTILINE))
+        if len(caught) != 3 or len(set(caught)) != 3:
+            wrong.append(f"targets caught: {caught}, want 3 distinct")
+        if not thrown or not thrown <= set(caught) or declared != set(caught):
+            wrong.append(f"thrown {sorted(thrown)}, caught {caught}, declared {sorted(declared)}")
+        if wrong:
+            r.fail(f"merged specs {f.name}", ", ".join(wrong))
+        else:
+            r.ok(f"merged specs {f.name}")
+    r.show_task(merged_specs)
     # Root descriptors expose ordinary component metadata to top caching and
     # loop-view hoisting, even when Goose leaves the helper out of line.
     def root_owner_caches():
@@ -2384,12 +2434,14 @@ def main():
                 script = gendir / f"completion.{shell}"
                 tc.write_text(script, out)
                 if shell == "bash":
-                    tc.write_text(gendir / "complete_me.goose", "fn main() {}\n")
+                    probe_dir = gendir / "completion_probe"
+                    probe_dir.mkdir(parents=True, exist_ok=True)
+                    tc.write_text(probe_dir / "complete_me.goose", "fn main() {}\n")
                     probe_sh = (f"source '{script}'; t() {{ COMP_WORDS=(\"$@\"); "
                                 "COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=(); _goose; "
                                 "echo \"${COMPREPLY[*]}\"; }; t goose bu; t goose build --dr; t goose complete_m")
                     r2 = subprocess.run(["bash", "-c", probe_sh], capture_output=True, text=True,
-                                        cwd=gendir)
+                                        cwd=probe_dir)
                     lines = r2.stdout.splitlines()
                     checks.append(("completion bash, run", lines == ["build", "--dry-run", "complete_me.goose"],
                                    r2.stdout + r2.stderr))
@@ -2661,6 +2713,31 @@ def main():
             r.fail("deep expressions", str(e))
     r.show_task(deep_expressions)
 
+    def copy_elision():
+        from copy_elision import check_copy_elision
+        try:
+            n = check_copy_elision(exe, cc, gendir)
+            r.ok(f"copy elision: {n} generated programs print the same at -O0 and -O2, with "
+                 "the copies of fixed structs over 256 bytes left out and with "
+                 "--no-copy-elision" + (", built" if cc else ", run"))
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("copy elision", str(e))
+    r.show_task(copy_elision)
+
+    def main_stack():
+        from main_stack import check_main_stack
+        try:
+            skipped = check_main_stack(exe, cc, gendir)
+            if skipped:
+                r.say(f"skip main stack ({skipped})")
+            else:
+                where = "run" + (" and built" if cc else "")
+                r.ok(f"main stack: a recursion of about 12 MB built / 24 MB in goose run, "
+                     f"{where} with the soft stack limit lowered to 8 MB")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("main stack", str(e))
+    r.show_task(main_stack)
+
     def diagnostics_json():
         from diagnostics_json import check_diagnostics_json
         try:
@@ -2763,7 +2840,7 @@ def main():
                 r.say(f"skip packages from git ({skipped})")
             else:
                 r.ok("packages from git: concurrent fetches, submodules, interrupted fetch, "
-                     "tag, commit, update, differing ref, offline")
+                     "tag, commit, update, differing ref, offline, cache path")
         except RuntimeError as e:
             r.fail("packages from git", str(e))
     r.show_task(git_packages)
